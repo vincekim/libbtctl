@@ -1,0 +1,19 @@
+----------------
+* How to build *
+----------------
+At root of working AOSP Android build ennvironment, 
+'make libbtctl' : for libbtctl
+
+It is faster to build at local directory.
+( cd external/bluetooth/abtctl/libbtctl_dev/libbtctl; mm)
+
+
+
+------------------
+* how to install *
+------------------
+On Android device running 4.3 or later,
+adb root
+adb remount
+adb push out/target/product/panda/system/lib/libbtctl.so system/lib/libbtctl.so
+
