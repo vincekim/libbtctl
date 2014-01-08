@@ -1,6 +1,8 @@
 ----------------
 * How to build *
 ----------------
+The git repo should be cloned into external/bluetooth under AOSP source tree.
+
 At root of working AOSP Android build ennvironment, 
 'make libbtctl' : for libbtctl
 
