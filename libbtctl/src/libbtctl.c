@@ -299,7 +299,7 @@ bt_status_t btctl_enable() {
     status = btctl_ctx.btiface->enable();
 
     while (1 ) {
-        pause();
+        sleep(1);
         if (wake_up_by == adapter_state_change_cb)
             break;
 
@@ -997,11 +997,11 @@ bt_status_t btctl_discovery_start_blocked()
     status = btctl_ctx.btiface->start_discovery();   
 
     /* wait until discovery_state_changed_cb sends a signal */
-    pause();
+    sleep(1);
     ALOGD("Wake up btctl_discovery_start_blocked\n");
     while ( wake_up_by != &discovery_state_changed_cb) {
         ALOGD("Sleep btctl_discovery_start_blocked\n");
-        pause();
+        sleep(1);
     }
 
     wake_up_by = 0;
@@ -1087,12 +1087,12 @@ bt_status_t btctl_connect(bt_bdaddr_t *bdaddr) {
     status = btctl_ctx.gattiface->client->connect(btctl_ctx.client_if, bdaddr , true);
 
 
-    pause();
+    sleep(1);
     ALOGD("Wake up btctl_connect wake_up_by %p\n", wake_up_by);
 
     while ( wake_up_by != &open_cb) {
         ALOGD("Sleep btctl_connect\n");
-        pause();
+        sleep(1);
     }
     wake_up_by = 0;
     sleep(3);
@@ -1144,7 +1144,7 @@ bt_status_t btctl_get_service(int conn_id, bt_uuid_t *p_uuid) {
 
 
     status = btctl_ctx.gattiface->client->search_service(conn_id, p_uuid);
-    pause();
+    sleep(1);
     if (status != BT_STATUS_SUCCESS) {
         ALOGD("Failed to search services\n");
 
@@ -1190,10 +1190,10 @@ bt_status_t btctl_get_characteristic(pConnection connection, int id)
     status = btctl_ctx.gattiface->client->get_characteristic(connection->conn_id,
                                                              &connection->svcs[id].svc_id, NULL);
 
-    pause();
+    sleep(1);
     while ( wake_up_by != &get_characteristic_cb) {
         ALOGD("Sleep btctl_connect\n");
-        pause();
+        sleep(1);
     }
     wake_up_by = 0;
     
@@ -1324,7 +1324,7 @@ void btctl_get_descriptor(pConnection connection, int svc_id, int char_id) {
                                                          &char_info->char_id, NULL);
 
     while (1 ) {
-        pause();
+        sleep(1);
         if (wake_up_by == get_descriptor_cb)
             break;
 
@@ -1420,12 +1420,12 @@ void btctl_write_req_char(pConnection connection, int svc_id, int char_id,  int 
 
     }
     
-    pause();
+    sleep(1);
     ALOGD("Wake up btctl_connect wake_up_by %p\n", wake_up_by);
 
     while ( wake_up_by != &write_characteristic_cb) {
         ALOGD("Sleep btctl_connect\n");
-        pause();
+        sleep(1);
     }
     wake_up_by = 0;
 }
@@ -1494,11 +1494,11 @@ void btctl_write_req_descriptor(pConnection connection, int svc_id, int char_id,
 
     }
     
-    pause();
+    sleep(1);
     ALOGD("Wake up btctl_connect wake_up_by %p\n", wake_up_by);
     while ( wake_up_by != &write_descriptor_cb) {
         ALOGD("Sleep btctl_connect\n");
-        pause();
+        sleep(1);
     }
     wake_up_by = 0;
 
