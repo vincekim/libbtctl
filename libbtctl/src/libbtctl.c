@@ -44,6 +44,8 @@
 
 
 #define DEV_LIST_SIZE 10
+#define CB_RETURN_TIMEOUT 5
+#define WRITE_REQ_CB_RETURN_TIMEOUT 7 /* it seems 7 sec is needed for bt stack to recover */
 #define ERROR(fmt, ...)     ALOGE("%s: " fmt,__FUNCTION__, ## __VA_ARGS__)
 
 #define ASSERTC(cond, msg, val) if (!(cond)) {ERROR("### ASSERT : %s line %d %s (%d) ###", __FILE__, __LINE__, msg, val);}
@@ -55,7 +57,10 @@
     else {                                  \
         ASSERTC(0, "Callback is NULL", 0);  \
     }
-
+typedef enum {
+    DEV_DISCONNECTED,
+    DEV_CONNECTED
+} btctl_connection_status_t;
 
 static pid_t mypid;
 static void (* wake_up_by)();
@@ -75,16 +80,40 @@ static bt_uuid_t app_uuid = {
 static libbtctl_ctx_t btctl_ctx;
 static List connection_list;
 
+static inline int wait_for_cb_timeout(void (*callback)(), int timeout) {
+
+    if (timeout < 0) {
+        wake_up_by = 0;
+        return 0;
+    }
+    if (timeout == 0) {
+        pause();
+        while ( wake_up_by != callback) {
+            ALOGD("Sleep ....\n");
+            pause();
+        }
+    } else {
+
+        while (timeout-- ) {
+            sleep(1);
+            if (wake_up_by == callback)
+                break;
+        }
+    }
+    wake_up_by = 0;
+    return timeout;   
+
+}
 
 static void get_characteristic_cb(int conn_id, int status, btgatt_srvc_id_t *srvc_id,
                                   btgatt_char_id_t *char_id, int char_prop);
 
 
-p_btctl_bt_device_prop_t alloc_dev_prop(p_btctl_bt_device_prop_t p_data)
+p_btctl_dev_prop_t alloc_dev_prop(p_btctl_dev_prop_t p_data)
 {
-    p_btctl_bt_device_prop_t p_dev_prop =  NULL;
+    p_btctl_dev_prop_t p_dev_prop =  NULL;
 
-    p_dev_prop = (p_btctl_bt_device_prop_t)calloc(1, sizeof(btctl_bt_device_prop_t));
+    p_dev_prop = (p_btctl_dev_prop_t)calloc(1, sizeof(btctl_bt_device_prop_t));
 
     if (p_data->bd_name.name) {
         strncpy((char *)p_dev_prop->bd_name.name, (char *)p_data->bd_name.name, sizeof(p_dev_prop->bd_name.name));      
@@ -110,7 +139,7 @@ static void realloc_bt_device_list()
     max = max * 2;
 
     btctl_ctx.dicovered_device_list.max = max;
-    btctl_ctx.dicovered_device_list.p_bt_device_list = realloc(btctl_ctx.dicovered_device_list.p_bt_device_list, sizeof(p_btctl_bt_device_prop_t) * max);      
+    btctl_ctx.dicovered_device_list.p_bt_device_list = realloc(btctl_ctx.dicovered_device_list.p_bt_device_list, sizeof(p_btctl_dev_prop_t) * max);      
 
 }
 
@@ -122,7 +151,7 @@ inline int bt_device_list_empty()
 }
 
 
-static void dealloc_dev_prop(p_btctl_bt_device_prop_t p_data)
+static void dealloc_dev_prop(p_btctl_dev_prop_t p_data)
 {
 
     if (p_data->bd_alias) {
@@ -132,7 +161,7 @@ static void dealloc_dev_prop(p_btctl_bt_device_prop_t p_data)
 
 }
 
-static void enque_prop_data(p_btctl_bt_device_prop_t p_data)
+static void enque_prop_data(p_btctl_dev_prop_t p_data)
 {
     if (btctl_ctx.dicovered_device_list.count == btctl_ctx.dicovered_device_list.max)
         realloc_bt_device_list();
@@ -143,7 +172,7 @@ static void enque_prop_data(p_btctl_bt_device_prop_t p_data)
 static uint32_t free_bt_device_list()
 {
     uint32_t i = 0, count = btctl_ctx.dicovered_device_list.count;
-    p_btctl_bt_device_prop_t *dev_list;
+    p_btctl_dev_prop_t *dev_list;
 
 
     for (dev_list = btctl_ctx.dicovered_device_list.p_bt_device_list, i = 0; i < count; i++) {
@@ -164,7 +193,9 @@ static void init_bt_device_list(uint32_t count)
     max = (count > DEV_LIST_SIZE)? count : DEV_LIST_SIZE;
     btctl_ctx.dicovered_device_list.max = max;
 
-    btctl_ctx.dicovered_device_list.p_bt_device_list = malloc(sizeof(p_btctl_bt_device_prop_t) * max);
+    if (btctl_ctx.dicovered_device_list.p_bt_device_list != NULL)
+        free(btctl_ctx.dicovered_device_list.p_bt_device_list);
+    btctl_ctx.dicovered_device_list.p_bt_device_list = malloc(sizeof(p_btctl_dev_prop_t) * max);
 
 }
 
@@ -173,7 +204,7 @@ static void init_bt_device_list(uint32_t count)
 
 
 
-static void print_bt_device_prop(p_btctl_bt_device_prop_t p_data)
+static void print_bt_device_prop(p_btctl_dev_prop_t p_data)
 {
     char addr_str[BT_ADDRESS_STR_LEN];
     ALOGD("  name: %s\n", p_data->bd_name.name);
@@ -205,6 +236,11 @@ static void print_bt_device_prop(p_btctl_bt_device_prop_t p_data)
 
 static int find_svc(pConnection connection , btgatt_srvc_id_t *svc) {
     uint8_t i;
+
+    if (connection == NULL || connection->connection_status_flag == DEV_DISCONNECTED) {
+        ALOGE("Invalid connection\n");
+        return -1;
+    }
 
     for (i = 0; i < connection->svcs_size; i++)
         if (connection->svcs[i].svc_id.is_primary == svc->is_primary &&
@@ -298,13 +334,10 @@ bt_status_t btctl_enable() {
 
     status = btctl_ctx.btiface->enable();
 
-    while (1 ) {
-        sleep(1);
-        if (wake_up_by == adapter_state_change_cb)
-            break;
-
+    if (wait_for_cb_timeout(adapter_state_change_cb, CB_RETURN_TIMEOUT) < 0 ) {
+        ALOGE("callback adapter_state_change_cb didn't get called\n");
+        status = BT_STATUS_FAIL;    
     }
-    wake_up_by = 0;
     return status;
 }
 
@@ -433,7 +466,7 @@ static void device_found_cb(int num_properties, bt_property_t *properties) {
 
         case BT_PROPERTY_BDADDR:
             ALOGD("  addr: %s\n", ba2str((uint8_t *) prop.val,
-                    addr_str));
+                                         addr_str));
             memcpy(prop_data.bd_addr.address, prop.val, sizeof(prop_data.bd_addr.address));
             break;
 
@@ -628,9 +661,13 @@ static void open_cb(int conn_id, int status, int client_if,
         conn = (pConnection)malloc(sizeof(Connection));
         conn->conn_id = conn_id;
         conn->svcs_size = 0;
+        conn->connection_status_flag = DEV_CONNECTED;
         memcpy(&conn->bd_addr, bda, sizeof(conn->bd_addr));
         ListAddTail(&connection_list, conn);
 
+    } else {
+        ALOGE("Failed to connect to device %s, conn_id: %d, client_if: %d\n",
+              ba2str(bda->address, addr_str), conn_id, client_if);
     }
 
     CLIENT_CBACK(btctl_ctx.client, open_cb,
@@ -649,11 +686,21 @@ static void open_cb(int conn_id, int status, int client_if,
 static void close_cb(int conn_id, int status, int client_if,
                      bt_bdaddr_t *bda) {
     char addr_str[BT_ADDRESS_STR_LEN];
+    pConnection connection; 
     ALOGD("Disconnected from device conn_id: %d, addr: %s, client_if: %d, "
           "status: %d\n", conn_id,ba2str(bda->address, addr_str),
           client_if, status);
 
-    ListRemoveConnection(&connection_list,conn_id);
+    //ListRemoveConnection(&connection_list,conn_id);
+    connection = btctl_list_find_connection_by_connid(conn_id);
+
+    if (connection) {
+
+
+        connection->connection_status_flag = DEV_DISCONNECTED; 
+
+
+    }
     CLIENT_CBACK(btctl_ctx.client, close_cb,
                  conn_id, status, client_if, bda);
 
@@ -812,7 +859,7 @@ static void get_descriptor_cb(int conn_id, int status, btgatt_srvc_id_t *srvc_id
     }
 
     connection = ListFindConnectionByID(&connection_list, conn_id);
-    if ( connection == NULL) {
+    if ( connection == NULL || connection->connection_status_flag == DEV_DISCONNECTED) {
         ALOGD("Invalid connection\n");
         goto exit;
 
@@ -922,7 +969,7 @@ static void read_characteristic_cb(int conn_id, int status,
 
     CLIENT_CBACK(btctl_ctx.client, read_characteristic_cb,
                  conn_id, status, p_data);
-    
+
 
 }
 
@@ -930,7 +977,7 @@ static void write_characteristic_cb(int conn_id, int status,
                                     btgatt_write_params_t *p_data) {
     CLIENT_CBACK(btctl_ctx.client, write_characteristic_cb,
                  conn_id, status, p_data);
-    
+    ALOGE("conn_id %d , write_characteristic_cb",conn_id); 
     wake_up_by = &write_characteristic_cb;
     kill(mypid, SIGCONT);
 
@@ -997,17 +1044,10 @@ bt_status_t btctl_discovery_start_blocked()
     status = btctl_ctx.btiface->start_discovery();   
 
     /* wait until discovery_state_changed_cb sends a signal */
-    sleep(1);
-    ALOGD("Wake up btctl_discovery_start_blocked\n");
-    while ( wake_up_by != &discovery_state_changed_cb) {
-        ALOGD("Sleep btctl_discovery_start_blocked\n");
-        sleep(1);
+    if (wait_for_cb_timeout(discovery_state_changed_cb, 0) < 0 ) {
+        ALOGE("callback discovery_state_changed_cb didn't get called\n");
+        status = BT_STATUS_FAIL;    
     }
-
-    wake_up_by = 0;
-
-
-
     return status;
 }
 
@@ -1040,6 +1080,13 @@ bt_status_t btctl_discovery_stop()
     }
 
     status = btctl_ctx.btiface->cancel_discovery();
+
+    /* wait until discovery_state_changed_cb sends a signal */
+    if (wait_for_cb_timeout(discovery_state_changed_cb, CB_RETURN_TIMEOUT) < 0 ) {
+        ALOGE("callback discovery_state_changed_cb didn't get called\n");
+        status = BT_STATUS_FAIL;    
+    }
+
     return status;
 }
 
@@ -1048,7 +1095,7 @@ void btctl_print_discovered_devices()
 {
     int i = 0,count = btctl_ctx.dicovered_device_list.count;
 
-    p_btctl_bt_device_prop_t *dev_list;
+    p_btctl_dev_prop_t *dev_list;
 
     for (dev_list = btctl_ctx.dicovered_device_list.p_bt_device_list, i = 0; i < count; i++) {
         ALOGD("\nDevice found\n");
@@ -1057,6 +1104,61 @@ void btctl_print_discovered_devices()
     }
 }
 
+p_btctl_dev_prop_t* btctl_get_discovered_dev_array() {  
+    return btctl_ctx.dicovered_device_list.p_bt_device_list;   
+}
+
+int btctl_get_count_discovered_dev_array() {
+    return btctl_ctx.dicovered_device_list.count;   
+}
+
+char * btctl_get_dev_name_from_dev_prop(p_btctl_dev_prop_t p_data) {
+    if (p_data == NULL)
+        return NULL;
+    return (char *) (p_data->bd_name.name);    
+}
+
+bt_bdaddr_t * btctl_get_bdaddr_from_dev_prop(p_btctl_dev_prop_t p_data) {
+    if (p_data == NULL)
+        return NULL;
+    return &p_data->bd_addr;    
+}
+
+
+uint8_t * btctl_get_address_from_dev_prop(p_btctl_dev_prop_t p_data) {
+    if (p_data == NULL)
+        return NULL;
+    return p_data->bd_addr.address;    
+}
+
+uint32_t btctl_get_bd_class_from_dev_prop(p_btctl_dev_prop_t p_data) {
+    if (p_data == NULL)
+        return 0;
+    return p_data->bd_class;
+    
+}
+
+bt_device_type_t btctl_get_bd_type_from_dev_prop(p_btctl_dev_prop_t p_data) {
+    if (p_data == NULL)
+        return 0;
+    return p_data->bd_type;
+    
+}
+
+
+char * btctl_get_bd_alias_from_dev_prop(p_btctl_dev_prop_t p_data) {
+    if (p_data == NULL)
+        return NULL;
+    return p_data->bd_alias;
+    
+}
+
+uint8_t btctl_get_bd_rssi_from_dev_prop(p_btctl_dev_prop_t p_data) {
+    if (p_data == NULL)
+        return 0;
+    return p_data->bd_rssi;
+    
+}
 
 
 bt_status_t btctl_connect(bt_bdaddr_t *bdaddr) {
@@ -1086,15 +1188,11 @@ bt_status_t btctl_connect(bt_bdaddr_t *bdaddr) {
 
     status = btctl_ctx.gattiface->client->connect(btctl_ctx.client_if, bdaddr , true);
 
-
-    sleep(1);
-    ALOGD("Wake up btctl_connect wake_up_by %p\n", wake_up_by);
-
-    while ( wake_up_by != &open_cb) {
-        ALOGD("Sleep btctl_connect\n");
-        sleep(1);
+    if (wait_for_cb_timeout(&open_cb, CB_RETURN_TIMEOUT) < 0 ) {
+        ALOGE("callback open_cb didn't get called\n");
+        status = BT_STATUS_FAIL;    
     }
-    wake_up_by = 0;
+
     sleep(3);
 
     if (status != BT_STATUS_SUCCESS) {
@@ -1109,14 +1207,19 @@ bt_status_t btctl_connect(bt_bdaddr_t *bdaddr) {
 bt_status_t btctl_disconnect(pConnection connection ) {
     bt_status_t status;
     char addr_str[BT_ADDRESS_STR_LEN];
-    
+
+    if (connection == NULL) {
+        ALOGE("Invalid connection\n");
+        return BT_STATUS_RMT_DEV_DOWN;
+    }
+
     if (connection->conn_id <= 0) {
         ALOGE("Device not connected\n");
         return BT_STATUS_NOT_READY;
     }
 
     status = btctl_ctx.gattiface->client->disconnect(btctl_ctx.client_if,  &connection->bd_addr,
-                                             connection->conn_id);
+                                                     connection->conn_id);
     if (status != BT_STATUS_SUCCESS) {
         ALOGE("Failed to disconnect, status: %d\n", status);
         return BT_STATUS_FAIL; 
@@ -1124,12 +1227,28 @@ bt_status_t btctl_disconnect(pConnection connection ) {
     return BT_STATUS_SUCCESS;
 }
 
+int btctl_get_conn_id(pConnection connection ) {
 
-bt_status_t btctl_get_service(int conn_id, bt_uuid_t *p_uuid) {
+    if (connection == NULL) {
+        ALOGE("Invalid connection\n");
+        return 0;
+    }
+    return connection->conn_id;
+
+}
+
+bt_status_t btctl_get_service(pConnection connection, bt_uuid_t *p_uuid) {
     bt_status_t status;
-    pConnection connection;
+    // pConnection connection;
+    int conn_id = 0;
 
     ALOGD("btctl_get_service\n");
+
+    if (connection == NULL || connection->connection_status_flag == DEV_DISCONNECTED) {
+        ALOGE("Invalid connection\n");
+        return BT_STATUS_RMT_DEV_DOWN;
+    }
+    conn_id = connection->conn_id;
     if (conn_id <= 0) {
         ALOGD("Not connected\n");
         return BT_STATUS_FAIL;
@@ -1161,6 +1280,11 @@ bt_status_t btctl_get_characteristic(pConnection connection, int id)
     service_info_t *svc_info;
     struct sigaction sigact;
 
+    if (connection == NULL || connection->connection_status_flag == DEV_DISCONNECTED) {
+        ALOGE("Invalid connection\n");
+        return BT_STATUS_RMT_DEV_DOWN;
+    }
+
     sigemptyset(&sigact.sa_mask);
     sigact.sa_flags = 0;
     sigact.sa_handler = catcher;
@@ -1190,14 +1314,11 @@ bt_status_t btctl_get_characteristic(pConnection connection, int id)
     status = btctl_ctx.gattiface->client->get_characteristic(connection->conn_id,
                                                              &connection->svcs[id].svc_id, NULL);
 
-    sleep(1);
-    while ( wake_up_by != &get_characteristic_cb) {
-        ALOGD("Sleep btctl_connect\n");
-        sleep(1);
+    if (wait_for_cb_timeout(get_characteristic_cb, CB_RETURN_TIMEOUT) < 0 ) {
+        ALOGE("callback get_characteristic_cb didn't get called\n");
+        status = BT_STATUS_FAIL;    
     }
-    wake_up_by = 0;
-    
-    
+
     if (status != BT_STATUS_SUCCESS) {
         ALOGE("Failed to list characteristics\n");
         return status;
@@ -1215,7 +1336,7 @@ int btctl_search_service_uuid_and_get_index(pConnection connection, bt_uuid_t *u
     // bt_uuid_t uuid;
     char uuid_str[UUID128_STR_LEN] = {0};
 
-    if (connection == NULL) {
+    if (connection == NULL || connection->connection_status_flag == DEV_DISCONNECTED) {
         ALOGE("Invalid connection\n");
         return -1;
 
@@ -1244,7 +1365,7 @@ int btctl_search_characteristic_uuid_and_get_index(pConnection connection, int s
     service_info_t *svc_info;
     char uuid_str[UUID128_STR_LEN] = {0};
 
-    if (connection == NULL) {
+    if (connection == NULL || connection->connection_status_flag == DEV_DISCONNECTED) {
         ALOGE("Invalid connection\n");
         return -1;
 
@@ -1278,6 +1399,11 @@ int btctl_search_svc_n_char_uuid_and_get_index(pConnection connection, int *serv
     *service_index = -1;
     *char_index = -1;
 
+    if (connection == NULL || connection->connection_status_flag == DEV_DISCONNECTED) {
+        ALOGE("Invalid connection\n");
+        return -1;
+
+    }
 
     *service_index =  btctl_search_service_uuid_and_get_index(connection, svc_uuid);
 
@@ -1299,22 +1425,27 @@ int btctl_search_svc_n_char_uuid_and_get_index(pConnection connection, int *serv
 
 
 
-void btctl_get_descriptor(pConnection connection, int svc_id, int char_id) {
+bt_status_t btctl_get_descriptor(pConnection connection, int svc_id, int char_id) {
     bt_status_t status;
     service_info_t *svc_info;
     char_info_t *char_info;
 
+    if (connection == NULL || connection->connection_status_flag == DEV_DISCONNECTED) {
+        ALOGE("Invalid connection\n");
+        return BT_STATUS_RMT_DEV_DOWN;
+    }
+
     if (svc_id < 0 || svc_id >= connection->svcs_size) {
         ALOGE("Invalid serviceID: %i need to be between 0 and %i\n", svc_id,
               connection->svcs_size - 1);
-        return;
+        return BT_STATUS_FAIL;
     }
 
     svc_info = &connection->svcs[svc_id];
     if (char_id < 0 || char_id >= svc_info->char_count) {
         ALOGE("Invalid characteristicID, try to run characteristics "
               "command.\n");
-        return;
+        return BT_STATUS_FAIL;
     }
 
     char_info = &svc_info->chars_buf[char_id];
@@ -1323,37 +1454,41 @@ void btctl_get_descriptor(pConnection connection, int svc_id, int char_id) {
     status = btctl_ctx.gattiface->client->get_descriptor(connection->conn_id, &svc_info->svc_id,
                                                          &char_info->char_id, NULL);
 
-    while (1 ) {
-        sleep(1);
-        if (wake_up_by == get_descriptor_cb)
-            break;
-
+    if (wait_for_cb_timeout(get_descriptor_cb, CB_RETURN_TIMEOUT) < 0 ) {
+        ALOGE("callback get_descriptor_cb didn't get called\n");
+        status = BT_STATUS_FAIL;    
     }
-    wake_up_by = 0;
 
     if (status != BT_STATUS_SUCCESS) {
         ALOGE("Failed to list characteristic descriptors\n");
 
     }
+    return status;
 
 }
 
-void btctl_reg_notification(pConnection connection, int svc_id, int char_id) {
+bt_status_t btctl_reg_notification(pConnection connection, int svc_id, int char_id) {
     bt_status_t status;
     service_info_t *svc_info;
     char_info_t *char_info;
 
+    if (connection == NULL || connection->connection_status_flag == DEV_DISCONNECTED) {
+        ALOGE("Invalid connection\n");
+        return BT_STATUS_RMT_DEV_DOWN;
+    }
+
+
     if (svc_id < 0 || svc_id >= connection->svcs_size) {
         ALOGE("Invalid serviceID: %i need to be between 0 and %i\n", svc_id,
               connection->svcs_size - 1);
-        return;
+        return BT_STATUS_FAIL;
     }
 
     svc_info = &connection->svcs[svc_id];
     if (char_id < 0 || char_id >= svc_info->char_count) {
         ALOGE("Invalid characteristicID, try to run characteristics "
               "command\n");
-        return;
+        return BT_STATUS_FAIL;
     }
 
     char_info = &svc_info->chars_buf[char_id];
@@ -1366,10 +1501,47 @@ void btctl_reg_notification(pConnection connection, int svc_id, int char_id) {
               "notification/indication\n");
 
     usleep(100000);
+    return status;
 }
 
+bt_status_t btctl_unreg_notification(pConnection connection, int svc_id, int char_id) {
+    bt_status_t status;
+    service_info_t *svc_info;
+    char_info_t *char_info;
 
-void btctl_write_cmd_char(pConnection connection, int svc_id, int char_id,  int auth, char *new_value, int new_value_len)
+    if (connection == NULL || connection->connection_status_flag == DEV_DISCONNECTED) {
+        ALOGE("Invalid connection\n");
+        return BT_STATUS_RMT_DEV_DOWN;
+    }
+
+
+    if (svc_id < 0 || svc_id >= connection->svcs_size) {
+        ALOGE("Invalid serviceID: %i need to be between 0 and %i\n", svc_id,
+              connection->svcs_size - 1);
+        return BT_STATUS_FAIL;
+    }
+
+    svc_info = &connection->svcs[svc_id];
+    if (char_id < 0 || char_id >= svc_info->char_count) {
+        ALOGE("Invalid characteristicID, try to run characteristics "
+              "command\n");
+        return BT_STATUS_FAIL;
+    }
+
+    char_info = &svc_info->chars_buf[char_id];
+    status = btctl_ctx.gattiface->client->deregister_for_notification(btctl_ctx.client_if,
+                                                                      &connection->bd_addr,
+                                                                      &svc_info->svc_id,
+                                                                      &char_info->char_id);
+    if (status != BT_STATUS_SUCCESS)
+        ALOGE("Failed to unregister for characteristic "
+              "notification/indication\n");
+
+    usleep(100000);
+    return status;
+}
+
+bt_status_t btctl_write_cmd_char(pConnection connection, int svc_id, int char_id,  int auth, char *new_value, int new_value_len)
 {
     bt_status_t status;
     service_info_t *svc_info;
@@ -1377,6 +1549,13 @@ void btctl_write_cmd_char(pConnection connection, int svc_id, int char_id,  int 
     char *saveptr = NULL, *tok;
     int params = 0;
     int write_type = 1;
+
+    if (connection == NULL || connection->connection_status_flag == DEV_DISCONNECTED) {
+        ALOGE("Invalid connection\n");
+        return BT_STATUS_RMT_DEV_DOWN;
+    }
+
+
 
     svc_info = &connection->svcs[svc_id];
 
@@ -1393,10 +1572,11 @@ void btctl_write_cmd_char(pConnection connection, int svc_id, int char_id,  int 
 
     }
     usleep(100000);
+    return status;
 
 }
 
-void btctl_write_req_char(pConnection connection, int svc_id, int char_id,  int auth, char *new_value, int new_value_len)
+bt_status_t btctl_write_req_char(pConnection connection, int svc_id, int char_id,  int auth, char *new_value, int new_value_len)
 {
     bt_status_t status;
     service_info_t *svc_info;
@@ -1405,10 +1585,16 @@ void btctl_write_req_char(pConnection connection, int svc_id, int char_id,  int 
     int params = 0;
     int write_type = 2;
 
+    if (connection == NULL || connection->connection_status_flag == DEV_DISCONNECTED) {
+        ALOGE("Invalid connection\n");
+        return BT_STATUS_RMT_DEV_DOWN;
+    }
+
     svc_info = &connection->svcs[svc_id];
 
     char_info = &svc_info->chars_buf[char_id];
 
+    ALOGE("conn_id %d, btctl_write_req_char\n", connection->conn_id);
     status = btctl_ctx.gattiface->client->write_characteristic(connection->conn_id,
                                                                &svc_info->svc_id,
                                                                &char_info->char_id,
@@ -1417,20 +1603,17 @@ void btctl_write_req_char(pConnection connection, int svc_id, int char_id,  int 
                                                                auth, new_value);
     if (status != BT_STATUS_SUCCESS) {
         ALOGE("Failed to write characteristic\n");
-
+        return status;
     }
-    
-    sleep(1);
-    ALOGD("Wake up btctl_connect wake_up_by %p\n", wake_up_by);
 
-    while ( wake_up_by != &write_characteristic_cb) {
-        ALOGD("Sleep btctl_connect\n");
-        sleep(1);
+    if (wait_for_cb_timeout(&write_characteristic_cb, WRITE_REQ_CB_RETURN_TIMEOUT) < 0 ) {
+        ALOGE("conn_id %d, callback write_characteristic_cb didn't get called\n", connection->conn_id);
     }
-    wake_up_by = 0;
+    return status;
+
 }
 
-void btctl_write_cmd_descriptor(pConnection connection, int svc_id, int char_id,  int desc_id , int auth, char *new_value, int new_value_len )
+bt_status_t btctl_write_cmd_descriptor(pConnection connection, int svc_id, int char_id,  int desc_id , int auth, char *new_value, int new_value_len )
 {
     bt_status_t status;
     service_info_t *svc_info;
@@ -1440,6 +1623,11 @@ void btctl_write_cmd_descriptor(pConnection connection, int svc_id, int char_id,
     int params = 0;
     int write_type = 1;/* Write No Request */
 
+    if (connection == NULL || connection->connection_status_flag == DEV_DISCONNECTED) {
+        ALOGE("Invalid connection\n");
+        return BT_STATUS_RMT_DEV_DOWN;
+    }
+
 
     svc_info = &connection->svcs[svc_id];
 
@@ -1457,13 +1645,14 @@ void btctl_write_cmd_descriptor(pConnection connection, int svc_id, int char_id,
 
 
     if (status != BT_STATUS_SUCCESS) {
-        ALOGE("Failed to write characteristic\n");
+        ALOGE("Failed to write descriptor\n");
 
     }
     usleep(100000);
+    return status;
 }
 
-void btctl_write_req_descriptor(pConnection connection, int svc_id, int char_id,  int desc_id , int auth, char *new_value, int new_value_len )
+bt_status_t btctl_write_req_descriptor(pConnection connection, int svc_id, int char_id,  int desc_id , int auth, char *new_value, int new_value_len )
 {
     bt_status_t status;
     service_info_t *svc_info;
@@ -1473,6 +1662,10 @@ void btctl_write_req_descriptor(pConnection connection, int svc_id, int char_id,
     int params = 0;
     int write_type = 2;/* Write Request */
 
+    if (connection == NULL || connection->connection_status_flag == DEV_DISCONNECTED) {
+        ALOGE("Invalid connection\n");
+        return BT_STATUS_RMT_DEV_DOWN;
+    }
 
     svc_info = &connection->svcs[svc_id];
 
@@ -1490,32 +1683,45 @@ void btctl_write_req_descriptor(pConnection connection, int svc_id, int char_id,
 
 
     if (status != BT_STATUS_SUCCESS) {
-        ALOGE("Failed to write characteristic\n");
+        ALOGE("Failed to write descriptor\n");
+        return status;
+    }
 
+    if (wait_for_cb_timeout(write_descriptor_cb, WRITE_REQ_CB_RETURN_TIMEOUT) < 0 ) {
+        ALOGE("conn_id %d, callback write_descriptor_cb didn't get called\n", connection->conn_id); 
+        status = BT_STATUS_FAIL;
     }
-    
-    sleep(1);
-    ALOGD("Wake up btctl_connect wake_up_by %p\n", wake_up_by);
-    while ( wake_up_by != &write_descriptor_cb) {
-        ALOGD("Sleep btctl_connect\n");
-        sleep(1);
-    }
-    wake_up_by = 0;
+    return status;
 
 }
 
 pConnection btctl_list_get_head_connection () {
+    ListCleanupDisconnectedDev(&connection_list);
     pNode node = ListGetHead(&connection_list);
     return( (node == NULL) ? NULL : node->data);
 }
 
 pConnection btctl_list_get_tail_connection () {
+    ListCleanupDisconnectedDev(&connection_list);
     pNode node = ListGetTail(&connection_list);
     return( (node == NULL) ? NULL : node->data);
 }
 
 pConnection btctl_list_get_next_connection (pConnection connection) {
-    pNode node = ListGetNext(connection->node);
+    pNode node = NULL;
+    if (connection == NULL) {
+        ALOGE("Invalid connection\n");
+        return NULL;
+    }
+    node = ListGetNext(connection->node);
+    while (node && (node->data->connection_status_flag == DEV_DISCONNECTED) ) {
+        ALOGD("conn_id %d is disconnected, it will be removed from list",node->data->conn_id);        
+        node = node->next;
+    } 
+
+    ListCleanupDisconnectedDev(&connection_list);
+
+
     return( (node == NULL) ? NULL : node->data);
 }
 
@@ -1524,15 +1730,28 @@ pConnection btctl_list_find_connection_by_connid(int conn_id) {
     return( ListFindConnectionByID(&connection_list, conn_id));
 }
 
-void btctl_list_print_all_connection() {
-    ListPrintAllConnection(&connection_list);
+int btctl_list_get_total_connection_count() {
+    ListCleanupDisconnectedDev(&connection_list);
+    return connection_list.count;
 }
+
+void btctl_list_print_all_connected_dev() {
+    ListCleanupDisconnectedDev(&connection_list);
+    ListPrintAllConnectedDev(&connection_list);
+}
+
 
 /* return 0 if both uuid are same */
 int btctl_util_uuidcmp(bt_uuid_t *uuid_dst, bt_uuid_t *uuid_src) {
 
     return( memcmp(uuid_dst->uu, uuid_src->uu, 16 ) );
 
+}
+
+/* return 0 if both bd_addr are same */
+int btctl_util_bt_bdaddr_cmp(bt_bdaddr_t *bt_addr_dst, bt_bdaddr_t *bt_addr_src) {
+
+    return( memcmp(bt_addr_dst->address, bt_addr_src->address, 6 ) );
 }
 
 /* GATT client callbacks */
@@ -1626,8 +1845,8 @@ p_libbtctl_ctx_t btctl_init(const btgatt_client_callbacks_t *gatt_callbacks , bt
     btctl_ctx.adapter_state = BT_STATE_OFF; /* The adapter is OFF in the beginning */
 
 
-    //gattcbs.client = gatt_callbacks;
-    btctl_ctx.client = gatt_callbacks;
+
+    btctl_ctx.client = (btgatt_client_callbacks_t *)(gatt_callbacks);
     gattcbs.client = &btctl_gattccbs;
 
     btctl_ctx.bt_callbacks= bt_callbacks;
@@ -1638,6 +1857,7 @@ p_libbtctl_ctx_t btctl_init(const btgatt_client_callbacks_t *gatt_callbacks , bt
     if (status < 0) {
         errno = status;
         err(1, "Failed to get the Bluetooth module");
+        return NULL;
     }
     ALOGD("Bluetooth stack infomation:\n");
     ALOGD("    id = %s\n", module->id);
@@ -1650,6 +1870,7 @@ p_libbtctl_ctx_t btctl_init(const btgatt_client_callbacks_t *gatt_callbacks , bt
     if (status < 0) {
         errno = status;
         err(2, "Failed to get the Bluetooth hardware device");
+        return NULL;
     }
     ALOGD("Bluetooth device infomation:\n");
     ALOGD("    API version = %d\n", hwdev->version);
@@ -1657,16 +1878,20 @@ p_libbtctl_ctx_t btctl_init(const btgatt_client_callbacks_t *gatt_callbacks , bt
     /* Get the Bluetooth interface */
     btdev = (bluetooth_device_t *) hwdev;
     btctl_ctx.btiface = btdev->get_bluetooth_interface();
-    if (btctl_ctx.btiface == NULL)
+    if (btctl_ctx.btiface == NULL) {
         err(3, "Failed to get the Bluetooth interface");
+        return NULL;
+    }
 
     /* Init the Bluetooth interface, setting a callback for each operation */
     status = btctl_ctx.btiface->init(&btcbs);
-    if (status != BT_STATUS_SUCCESS && status != BT_STATUS_DONE)
+    if (status != BT_STATUS_SUCCESS && status != BT_STATUS_DONE) {
         err(4, "Failed to initialize the Bluetooth interface");
+        return NULL;
+    }
 
     init_bt_device_list(DEV_LIST_SIZE);
 
-    return (&btctl_ctx);
+    return(&btctl_ctx);
 }
 

@@ -7,7 +7,7 @@ At root of working AOSP Android build ennvironment,
 'make libbtctl' : for libbtctl
 
 It is faster to build at local directory.
-( cd external/bluetooth/libbtctl/libbtctl/libbtctl; mm)
+( cd external/bluetooth/libbtctl/libbtctl; mm)
 
 
 

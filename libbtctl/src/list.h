@@ -113,19 +113,26 @@ void ListPrintAllConnection(pList list)
 {
     pNode head = list->head;
     char addr_str[BT_ADDRESS_STR_LEN];
-    printf("\n----\n");
+
     while (head) {
         printf("Conn ID %d, bd_addr %s \n", head->data->conn_id,  ba2str(head->data->bd_addr.address,
                                                                          addr_str) ) ;
         head = head->next;
     }
-
-
-    printf("\n----\n");
-
-
 }
 
+void ListPrintAllConnectedDev(pList list)
+{
+    pNode head = list->head;
+    char addr_str[BT_ADDRESS_STR_LEN];
+
+    while (head) {
+        if (head->data->connection_status_flag)
+            printf("Conn ID %d, bd_addr %s \n", head->data->conn_id,  ba2str(head->data->bd_addr.address,
+                                                                             addr_str) ) ;
+        head = head->next;
+    }
+}
 
 void ListClearSvcCacheAll(pList list)
 {
@@ -247,6 +254,37 @@ int ListRemoveConnection(pList list, int conn_id)
     return false;
 }
 
+int ListCleanupDisconnectedDev(pList list)
+{
+    pNode head = list->head;
+    pNode prev = NULL;
+    pNode next;
+
+    if (list == NULL)
+        return false;
+
+    while (head) {
+        if (head->data->connection_status_flag == 0 ) {
+            ALOGD("clean up conn_id %d from list\n",head->data->conn_id);
+            next = RemoveNode(head);
+            if ( next == NULL)
+                list->tail = prev;
+
+            if ( prev ) {
+                prev->next = next;
+            } else {
+                list->head  = next;
+            }
+
+            list->count--;  
+            return true;
+        } else {
+            prev = head;
+            head = head->next;
+        }
+    }
+    return false;
+}
 void ListRemoveAll(pList list)
 {
     pNode head = list->head;
